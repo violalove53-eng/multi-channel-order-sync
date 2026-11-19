@@ -1,0 +1,15 @@
+# Real order exports contain buyer PII — never commit them
+data/*
+!data/.gitkeep
+*.csv
+!sample_data/*.csv
+
+# Secrets
+.env
+
+# Build / IDE
+target/
+build/
+.idea/
+*.iml
+.DS_Store
