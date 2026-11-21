@@ -7,5 +7,4 @@ from core.models import RawOrder
 class OrderConnector(ABC):
 
     @abstractmethod
-    def fetch_orders(self, since: datetime | None) -> list[RawOrder]:
-        ...
+    def fetch_orders(self, since: datetime | None) -> list[RawOrder]: ...
