@@ -1,94 +1,95 @@
-# 订单同步项目规格（GitHub Project for Replit 面试）
+# Order Sync Project Spec
 
-_定稿 2026-11-18。范围：只做订单同步这一件事。_
+_Finalized 2026-11-18. Scope: order sync and nothing else._
 
-## 一句话
+## In One Sentence
 
-把 TikTok Shop（约 700 单）和 Shopify 独立站的订单，同步进一个自己的统一订单库 —— 管道做扎实，功能先不做。
+Sync orders from TikTok Shop (about 700 orders) and a Shopify storefront into one unified order store of my own: build a solid pipeline first and hold off on features.
 
-## 为什么是这个项目
+## Why This Project
 
-- 数据是真的：700 单是自己店里跑出来的，不是造的假数据
-- 形状是对的：多源接入、schema 映射、幂等、水位线 —— 全是 Connectors / 平台后端岗的日常
-- 故事是现成的：每个被砍掉的功能都有数据层面的理由（见文末"面试故事"）
+- The data is real: the 700 orders came from my own shop and are not fabricated
+- The shape is right: multi-source ingestion, schema mapping, idempotency, watermarks
+- The trade-offs are grounded: every cut feature has a data-level reason (see "Design Decisions" at the end)
 
-## 范围
+## Scope
 
-**做：**
-- TikTok 订单导入（v1 用卖家中心导出的 CSV；连接器接口按标准形态设计，资质下来可换真 API）
-- Shopify 订单同步（GraphQL API 真连接，订单量小，先用它把管道练通）
-- 统一订单模型 + 两份 schema 映射
-- 幂等写入、增量水位线、失败重试 + 死信、同步运行日志
+**In scope:**
+- TikTok order import (v1 uses CSV exports from Seller Center; the connector interface follows the standard shape, so the real API can replace it once access is approved)
+- Shopify order sync (live GraphQL API connection; order volume is small, so it is used first to get the pipeline working)
+- Unified order model + two schema mappings
+- Idempotent writes, incremental watermarks, failure retries + dead letter, sync run logs
 
-**不做（明确砍掉，理由见文末）：**
-- 防超卖自动下架 —— 价格链接订单不带商品身份，无从匹配
-- 合单、对账 —— TikTok 卖家中心原生自带，不重复造
-- 报表 / 场次分析 —— v2 再说，先把管道做完
+**Out of scope (deliberately cut, reasons at the end):**
+- Automatic delisting to prevent overselling: price-link orders carry no product identity, so there is nothing to match on
+- Order merging and reconciliation: TikTok Seller Center already provides these, so there is no need to rebuild them
+- Reports / live-session analytics: left for v2, after the pipeline is finished
 
-## 架构
+## Architecture
 
 ```
 TikTok CSV ──► Connector(TikTok) ──┐
-                                    ├──► Normalize(schema 映射) ──► 幂等 Upsert ──► 订单库 (Postgres)
-Shopify API ─► Connector(Shopify) ─┘                                        │
-                                                              sync_runs 日志 / failed_records 死信
+                                    ├──► Normalize (schema mapping) ──► Idempotent upsert ──► Order store (Postgres)
+Shopify API ─► Connector(Shopify) ─┘                                              │
+                                                            sync_runs log / failed_records (dead letter)
 ```
 
-- **Connector 接口**统一抽象：`fetchOrders(since watermark) -> 原始订单列表`。TikTok 实现读 CSV，Shopify 实现调 GraphQL，上层不感知差异
-- **Normalize**：每个平台一份映射表，翻成统一模型；原始报文整包存 `raw_payload` 留底，映射错了可重放
-- **存储**：Postgres（起步可用 SQLite，里程碑 2 前换掉）
+- **Connector interface** is a shared abstraction: `fetchOrders(since watermark) -> list of raw orders`. The TikTok implementation reads CSV, the Shopify implementation calls GraphQL, and upper layers don't see the difference
+- **Normalize**: one mapping table per platform translates into the unified model; the full raw record is kept in `raw_payload`, so a wrong mapping can be replayed
+- **Storage**: Postgres (SQLite is acceptable at the start, replaced before Milestone 2)
 
-## 统一订单模型（canonical schema）
+## Unified Order Model (Canonical Schema)
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
 | `source` | `tiktok` / `shopify` |
-| `source_order_id` | 平台原始订单号 |
-| `buyer_name` | 买家昵称 |
-| `status` | 统一枚举：`UNPAID / PAID / SHIPPED / DELIVERED / CANCELLED / REFUNDED`，各平台状态词映射进来 |
-| `total_amount` | 统一用分（整数）存，避免小数精度问题 |
+| `source_order_id` | Original order ID on the platform |
+| `buyer_name` | Buyer nickname |
+| `status` | Unified enum: `UNPAID / PAID / SHIPPED / DELIVERED / CANCELLED / REFUNDED`; each platform's status terms map into it |
+| `total_amount` | Stored in cents (integer) to avoid decimal precision issues |
 | `currency` | USD |
-| `price_tier` | 价格档（4.99 / 6.99 / …），TikTok 价格链接模式特有，保留原始档位 |
-| `created_at / paid_at / shipped_at` | 时间戳，统一 UTC |
-| `raw_payload` | 平台原始数据 JSON 留底 |
+| `price_tier` | Price tier (4.99 / 6.99 / …), specific to TikTok's price-link model; the original tier is preserved |
+| `created_at / paid_at / shipped_at` | Timestamps, all UTC |
+| `raw_payload` | Original platform data as JSON, kept for reference |
 
-唯一键：`(source, source_order_id)`。
+Unique key: `(source, source_order_id)`.
 
-## 三个核心机制
+## Three Core Mechanisms
 
-**1. 幂等（idempotent）**
-- 按唯一键 upsert：记录不存在 → 插入；存在且无变化 → 跳过；存在且带更新 → 覆盖
-- **状态防倒退**：状态机只许前进（`PAID → SHIPPED → DELIVERED`），迟到的旧数据不许把"已发货"覆盖回"待发货"；`CANCELLED / REFUNDED` 为终态
-- 验收标准：同一批数据连跑 3 遍，行数与内容分毫不差
+**1. Idempotency**
+- Upsert by unique key: record doesn't exist → insert; exists and unchanged → skip; exists with an update → overwrite
+- **No status regression**: the state machine only moves forward (`PAID → SHIPPED → DELIVERED`), so late, stale data cannot overwrite "shipped" back to "awaiting shipment"; `CANCELLED / REFUNDED` are terminal
+- Acceptance criterion: running the same batch 3 times in a row produces identical row counts and contents
 
-**2. 水位线（watermark）**
-- 每个连接器一行水位线记录：`last_synced_at`
-- 每次只拉水位线之后的数据；**故意回退 15 分钟重叠**防边界漏单，重叠的重复靠幂等兜底
-- 水位线只在一整批全部写成功后才推进；中途崩了，下次从原水位线重拉
+**2. Watermark**
+- One watermark record per connector: `last_synced_at`
+- Each run fetches only data after the watermark; it **deliberately rewinds 15 minutes as an overlap** to avoid missing orders at the boundary, and idempotency absorbs the resulting duplicates
+- The watermark advances only after an entire batch is written successfully; after a mid-run crash, the next run refetches from the original watermark
 
-**3. 失败处理**
-- 单条失败不拖垮整批：进 `failed_records` 死信表（原始数据 + 错误原因），其余照常同步
-- API 侧失败：指数退避重试（Shopify 限流按其返回的节流信号走）
-- 每次同步写一条 `sync_runs`：开始/结束时间、拉取数、新增数、跳过数、更新数、失败数 —— 这是将来面试报数字的来源
+**3. Failure Handling**
+- One failed record doesn't take down the batch: it goes to the `failed_records` dead-letter table (raw data + error reason) while the rest sync normally
+- API-side failures: retry with exponential backoff (Shopify rate limiting follows the throttle signals it returns)
+- Each sync writes one `sync_runs` row: start/end time and fetched, inserted, skipped, updated and failed counts. This is the source of the run metrics
 
-## 里程碑（按周末计）
+## Milestones (by Weekend)
 
-- **W1 — Shopify 打通**：GraphQL 拉单 → 映射 → 幂等入库 → 水位线增量。量小，专练管道
-- **W2 — TikTok 全量**：从卖家中心导出订单 CSV（拿到样本后按真实列名定稿第二份映射表），700 单导入，行数对账
-- **W3 — 健壮性**：死信 + 重试 + sync_runs 日志；做三遍重跑幂等验收、断点续跑验收
-- **W4 — 产出物**：README（架构图 + 三个核心机制各一段）+ 30 秒演示 + 数字整理
+- **W1 — Shopify end to end**: GraphQL fetch → mapping → idempotent write → incremental watermark. Low volume, focused on the pipeline
+- **W2 — Full TikTok import**: export orders as CSV from Seller Center (finalize the second mapping table from real column names once a sample is available), import 700 orders, reconcile row counts
+- **W3 — Robustness**: dead letter + retries + sync_runs logging; acceptance tests for three-run idempotency and resuming after interruption
+- **W4 — Deliverables**: README (architecture diagram + one paragraph on each core mechanism) + 30-second demo + compiled numbers
 
-## 技术选型
+## Tech Choices
 
-- 语言：Java（十年存量，速度优先）；想顺带练面试语言的话 Go 亦可，项目重点不在语言
-- DB：Postgres；部署：最终把演示部署到 Replit 上
-- 不做前端；最多一个极简的同步状态页（读 sync_runs）
+- Language: Python, prioritizing speed; the language is not the point of the project
+- DB: Postgres; deployment: eventually deploy a live demo
+- No frontend; at most a minimal sync status page (reads sync_runs)
 
-## 面试弹药清单（W4 整理）
+## Target Metrics (Compiled in W4)
 
-**要跑出的数字：**总订单数（700+）、重复拦截数（重跑时跳过多少）、单次全量同步耗时、两份映射表各映射了多少字段。
+Total orders (700+), duplicates blocked (how many are skipped on re-run), full-sync duration, and number of fields mapped in each of the two mapping tables.
 
-**要会讲的故事：**
-1. 为什么砍掉防超卖 —— 价格链接订单不带商品身份，功能边界由数据模型决定
-2. 为什么 TikTok 用 CSV —— 开放 API 的资质现实；连接器接口按可替换设计，资质下来只换实现层
-3. 幂等的那句英文 —— "The sync is idempotent: every order is keyed by a unique ID, and when the same order arrives again, we either skip it if nothing changed, or upsert it if it carries a newer state."
+## Design Decisions
+
+1. Why overselling prevention was cut: price-link orders carry no product identity, so the data model sets the feature boundary
+2. Why TikTok uses CSV: the practical reality of open API approval; the connector interface is designed to be swappable, so only the implementation layer changes once access is approved
+3. Idempotency semantics: "The sync is idempotent: every order is keyed by a unique ID, and when the same order arrives again, we either skip it if nothing changed, or upsert it if it carries a newer state."

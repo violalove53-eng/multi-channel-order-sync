@@ -84,7 +84,7 @@ class ShopifyConnector(OrderConnector):
             method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.load(resp)
-        print("granted scopes:", data.get("scope"))  # 今晚验收用：须含 read_orders，跑通后删掉这行
+        print("granted scopes:", data.get("scope"))  # For tonight's acceptance check: must include read_orders; delete this line once it works
         return data["access_token"]
 
     def fetch_orders(self, since: datetime | None) -> list[RawOrder]:
@@ -106,11 +106,11 @@ class ShopifyConnector(OrderConnector):
         if "errors" in data:
             raise RuntimeError(f"Shopify GraphQL errors: {data['errors']}")
         orders = []
-        for edge in data["data"]["orders"]["edges"]:  # 今晚只取第一页，4 单够用；分页明晚补
+        for edge in data["data"]["orders"]["edges"]:  # First page only for tonight; 4 orders is enough. Pagination comes tomorrow night
             node = edge["node"]
             orders.append(RawOrder(
                 source="shopify",
-                source_order_id=node["id"],  # 用 gid 当唯一键，不用 #1004 这种展示名
+                source_order_id=node["id"],  # Use the gid as the unique key, not a display name like #1004
                 source_updated_at=datetime.fromisoformat(node["updatedAt"].replace("Z", "+00:00")),
                 payload=node))
         return orders 
