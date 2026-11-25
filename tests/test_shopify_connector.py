@@ -9,13 +9,15 @@ Run from the project root:
 
 import io
 import json
+import os
+import tempfile
 import unittest
 import urllib.parse
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from connectors.shopify_connector import ShopifyConnector
+from connectors.shopify_connector import ShopifyConnector, _load_dotenv
 from core.models import RawOrder
 
 URLOPEN = "connectors.shopify_connector.urllib.request.urlopen"
@@ -32,14 +34,16 @@ def token_response() -> io.BytesIO:
 
 def orders_response(*nodes: dict, has_next_page: bool = False) -> io.BytesIO:
     """The shape Shopify's GraphQL API returns: data -> orders -> edges -> node."""
-    return fake_response({
-        "data": {
-            "orders": {
-                "edges": [{"node": node} for node in nodes],
-                "pageInfo": {"hasNextPage": has_next_page},
+    return fake_response(
+        {
+            "data": {
+                "orders": {
+                    "edges": [{"node": node} for node in nodes],
+                    "pageInfo": {"hasNextPage": has_next_page},
+                }
             }
         }
-    })
+    )
 
 
 def order_node(number: int, updated_at: str = "2026-11-20T14:03:22Z") -> dict:
@@ -69,8 +73,9 @@ class FetchOrdersTest(unittest.TestCase):
     # --- The loop: each edge["node"] becomes one RawOrder ---
 
     def test_each_node_becomes_one_raw_order(self):
-        orders, _ = self.fetch(token_response(),
-                               orders_response(order_node(1), order_node(2)))
+        orders, _ = self.fetch(
+            token_response(), orders_response(order_node(1), order_node(2))
+        )
 
         self.assertEqual(len(orders), 2)
         self.assertIsInstance(orders[0], RawOrder)
@@ -80,6 +85,36 @@ class FetchOrdersTest(unittest.TestCase):
         orders, _ = self.fetch(token_response(), orders_response())
 
         self.assertEqual(orders, [])
+
+    def test_uses_gid_not_display_name_as_key(self):
+        orders, _ = self.fetch(token_response(), orders_response(order_node(1)))
+
+        self.assertEqual(orders[0].source_order_id, "gid://shopify/Order/5001")
+
+    def test_from_env_reads_env_file(self):
+        fake_env = {
+            "SHOPIFY_STORE_DOMAIN": "test-store.myshopify.com",
+            "SHOPIFY_CLIENT_ID": "id",
+            "SHOPIFY_CLIENT_SECRET": "secret",
+        }
+
+        with patch(
+            "connectors.shopify_connector._load_dotenv"
+        ) as load_dotenv, patch.dict(os.environ, fake_env, clear=True):
+            connector = ShopifyConnector.from_env()
+
+        load_dotenv.assert_called_once_with()
+        self.assertEqual(connector.store_domain, "test-store.myshopify.com")
+
+    def test_dotenv_skips_comments_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "w") as fh:
+                fh.write("# comment\n\nSHOPIFY_STORE_DOMAIN=store.com\n# another comment\nSHOPIFY_CLIENT_ID=id\nSHOPIFY_CLIENT_SECRET=secret\n")
+
+            with patch.dict(os.environ, {}, clear=True):
+                _load_dotenv(path)
+                self.assertEqual(os.environ.get("SHOPIFY_STORE_DOMAIN"), "store.com")
 
 if __name__ == "__main__":
     unittest.main()
