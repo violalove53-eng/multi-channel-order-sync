@@ -116,5 +116,23 @@ class FetchOrdersTest(unittest.TestCase):
                 _load_dotenv(path)
                 self.assertEqual(os.environ.get("SHOPIFY_STORE_DOMAIN"), "store.com")
 
+
+    def test_source_updated_at_is_parsed(self):
+        orders, _ = self.fetch(token_response(), orders_response(order_node(1)))
+
+        self.assertEqual(
+            orders[0].source_updated_at,
+            datetime(2026, 11, 20, 14, 3, 22, tzinfo=timezone.utc),
+        )
+
+    def test_since_applies_15_minute_overlap(self):
+        since = datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)
+        _, requests = self.fetch(token_response(), orders_response(), since=since)
+
+        body = json.loads(requests[1].data)
+        self.assertEqual(
+            body["variables"]["queryStr"], "updated_at:>='2026-11-20T14:45:00Z'"
+        )
+
 if __name__ == "__main__":
     unittest.main()
