@@ -4,13 +4,12 @@ import json
 import os
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from core.connector import OrderConnector
 from core.models import RawOrder
 
 API_VERSION = "2026-10"
-OVERLAP = timedelta(minutes=15)
 
 ORDERS_QUERY = """
 query ShopifyOrders($first: Int!, $queryStr: String) {
@@ -91,7 +90,7 @@ class ShopifyConnector(OrderConnector):
         token = self._request_token()
         query_str = None
         if since is not None:
-            stamp = (since - OVERLAP).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            stamp = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             query_str = f"updated_at:>='{stamp}'"
         payload = json.dumps({"query": ORDERS_QUERY,
                               "variables": {"first": 50, "queryStr": query_str}}).encode()

@@ -125,13 +125,14 @@ class FetchOrdersTest(unittest.TestCase):
             datetime(2026, 11, 20, 14, 3, 22, tzinfo=timezone.utc),
         )
 
-    def test_since_applies_15_minute_overlap(self):
+    def test_since_is_used_as_is(self):
+        # The 15-minute rewind now lives in sync_shopify, so the connector must not rewind again
         since = datetime(2026, 11, 20, 15, 0, tzinfo=timezone.utc)
         _, requests = self.fetch(token_response(), orders_response(), since=since)
 
         body = json.loads(requests[1].data)
         self.assertEqual(
-            body["variables"]["queryStr"], "updated_at:>='2026-11-20T14:45:00Z'"
+            body["variables"]["queryStr"], "updated_at:>='2026-11-20T15:00:00Z'"
         )
 
 if __name__ == "__main__":
