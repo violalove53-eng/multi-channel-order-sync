@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 
 from connectors.shopify_connector import ShopifyConnector
+from connectors.shopify_mapping import map_shopify_order
+from core.writer import write_orders
 
 OVERLAP = timedelta(minutes=15)
 
@@ -48,9 +50,10 @@ def sync_shopify(conn, shopify: ShopifyConnector) -> None:
     # Why the write must be idempotent: we can fetch the same order more than once.
     #   The 15-minute rewind re-fetches orders already written by the previous run,
     #   and a run that fails midway doesn't advance the watermark, so the next run re-fetches the whole batch.
-    # TODO: write_orders(conn, orders) must be an idempotent write:
-    #   INSERT ... ON CONFLICT (source, source_order_id) DO UPDATE,
-    #   so duplicates from the rewind or a retry update the existing row instead of inserting a new one
+    # write_orders upserts on (source, source_order_id), so duplicates from the rewind
+    # or a retry update or skip the existing row instead of inserting a new one.
+    # It commits once for the whole batch and rolls back if any row fails.
+    write_orders(conn, [map_shopify_order(order) for order in orders])
 
     # 6. Only after the whole batch is written, save max_seen back to the watermarks table
     if max_seen is not None and max_seen != since:

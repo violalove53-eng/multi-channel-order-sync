@@ -1,7 +1,8 @@
 """Tests for load_watermark, save_watermark and sync_shopify.
 
 No database and no network: FakeConn stands in for a psycopg 3 connection
-and keeps the watermarks table in a dict; FakeShopify returns canned orders.
+and keeps the watermarks and orders tables in dicts; FakeShopify returns canned orders.
+The real upsert SQL is tested against Postgres in test_writer_postgres.py.
 
 Run from the project root:
     python3 -m unittest -v
@@ -25,12 +26,15 @@ class FakeResult:
 
 
 class FakeConn:
-    """Understands only the two SQL statements the watermark functions send."""
+    """Understands only the watermark SQL and the orders upsert."""
 
-    def __init__(self, watermarks=None):
+    def __init__(self, watermarks=None, fail_order_write=False):
         self.watermarks = dict(watermarks or {})
+        self.orders = {}
         self.commits = 0
+        self.rollbacks = 0
         self.writes = 0
+        self.fail_order_write = fail_order_write
 
     def execute(self, sql, params):
         sql = " ".join(sql.split())
@@ -43,10 +47,20 @@ class FakeConn:
             self.watermarks[source] = last_synced_at
             self.writes += 1
             return FakeResult(None)
+        if sql.startswith("INSERT INTO orders"):
+            if self.fail_order_write:
+                raise RuntimeError("database down")
+            source, source_order_id = params[0], params[1]
+            inserted = (source, source_order_id) not in self.orders
+            self.orders[(source, source_order_id)] = params
+            return FakeResult((inserted,))
         raise AssertionError(f"unexpected SQL: {sql}")
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 class FakeShopify:
@@ -60,7 +74,16 @@ class FakeShopify:
 
 
 def order(n, updated_at):
-    return RawOrder("shopify", f"gid://shopify/Order/{n}", updated_at, {"name": f"#{n}"})
+    node = {
+        "id": f"gid://shopify/Order/{n}",
+        "name": f"#{n}",
+        "createdAt": "2026-11-20T10:00:00Z",
+        "updatedAt": updated_at.isoformat(),
+        "displayFinancialStatus": "PAID",
+        "displayFulfillmentStatus": "UNFULFILLED",
+        "totalPriceSet": {"shopMoney": {"amount": "19.99", "currencyCode": "USD"}},
+    }
+    return RawOrder("shopify", node["id"], updated_at, node)
 
 
 class LoadWatermarkTests(unittest.TestCase):
@@ -147,6 +170,26 @@ class SyncShopifyTests(unittest.TestCase):
             sync_shopify(conn, Boom([]))
         self.assertEqual(conn.watermarks["shopify"], T0)
         self.assertEqual(conn.writes, 0)
+
+    def test_writes_every_fetched_order_including_overlap_duplicates(self):
+        conn = FakeConn({"shopify": T0})
+        shopify = FakeShopify([
+            order(1, T0 - timedelta(minutes=10)),   # inside the rewind, already written last run
+            order(2, T0 + timedelta(minutes=5)),
+        ])
+        sync_shopify(conn, shopify)
+        self.assertEqual(set(conn.orders), {
+            ("shopify", "gid://shopify/Order/1"),
+            ("shopify", "gid://shopify/Order/2"),
+        })
+
+    def test_order_write_failure_leaves_watermark_untouched(self):
+        conn = FakeConn({"shopify": T0}, fail_order_write=True)
+        with self.assertRaises(RuntimeError):
+            sync_shopify(conn, FakeShopify([order(1, T0 + timedelta(minutes=5))]))
+        self.assertEqual(conn.watermarks["shopify"], T0)
+        self.assertEqual(conn.writes, 0)
+        self.assertEqual(conn.rollbacks, 1)
 
 
 if __name__ == "__main__":
